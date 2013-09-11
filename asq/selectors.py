@@ -138,3 +138,35 @@ def identity(x):
         The argument x.
     '''
     return x
+
+
+def gc(name):
+    '''Sets an attribute 'name' on obj with the len of group
+
+    Args:
+      obj:  Will be returned
+      group:  Grouping
+
+    Returns:
+      obj with an attribute
+    '''        
+    def set_name(obj, group):
+        setattr(obj, name + "_count", len(group))
+        return obj
+    return set_name
+
+def gs(name, attr):
+    '''Sets an attribute 'name' on obj with the sum of attr 'attr' of
+       the group.
+
+    Args:
+      obj:  Will be returned
+      group:  Grouping
+
+    Returns:
+      obj with an attribute
+    '''        
+    def set_name(obj, group):
+        setattr(obj, name + "_sum", reduce(lambda s,x : s + x.__dict__[attr], group, 0))
+        return obj
+    return set_name
