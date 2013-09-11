@@ -171,14 +171,8 @@ except ImportError:
                 setattr(cls, opname, opfunc)
         return cls
 
-try:
-    # Python 2
-    basestring()
-    def is_string(s):
-        return isinstance(s, basestring)
-except NameError:
-    # Python 3
-    def is_string(s):
-        return isinstance(s, str)
+# Python 3
+def is_string(s):
+    return isinstance(s, str)
     
         
