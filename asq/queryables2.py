@@ -42,17 +42,30 @@ class OutOfRangeError(ValueError):
     pass
 
 class Collection(object):
-    def __init__(self, name, iterable):
-        self.dependencies = []
+    def __init__(self, name, iterable, query):
+        self.dependencies = []  # Things who are dependent on me
         self.iterable = iterable
+        self.query = query
 
-    def add_dependency(self, query):
-        self.dependencies.append(query)
+    def add_dependency(self, collection):
+        self.dependencies.append(collection)
 
     def insert(self, row):
         self.iterable.append(row)
         for dep in self.dependencies:
-            dep.apply_insert(self, row)
+            dep.receive_dep_insert(self, row)
+
+    def incr(self, row, col):
+        self.iterable[row.id].__dict__[col] += 1
+
+    def sum(self, row, col):
+        self.iterable[row.id].__dict__[col] += row.__dict__[col]
+
+    def receive_dep_insert(self, child_collection, dep_row):
+        """ Receive an insert from a collection on which I depend.
+        Apply it if necessary"""
+        self.query.apply_new_row(self, dep_row)
+
 
 class Queryable(object):
     '''Queries over iterables executed serially.
@@ -60,11 +73,16 @@ class Queryable(object):
     Queryable objects are constructed from iterables.
     '''
 
-    def apply_insert(self, collection, row):
+    def apply_new_row(self, collection, row):
         # test to see if row passes predicate
         # test to see if row passes order by
         # apply to group by based on row key and aggregate (sum, count, function)
-        pass
+        if self.count and self.count_predicate(row):
+            collection.incr(row, self.count)
+        elif self.sum and self.where(row):
+            collection.sum(row, self.sum.field)
+        elif self.where(row):
+            collection.insert(row)
 
     def __init__(self, iterable):
         '''Construct a Queryable from any iterable.
@@ -80,6 +98,7 @@ class Queryable(object):
                 .format(str(type(iterable))[7: -2]))
 
         self._iterable = iterable
+        self.where = []
 
     def __iter__(self):
         '''Support for the iterator protocol.
@@ -200,52 +219,13 @@ class Queryable(object):
                             "converted into a callable "
                             "selector".format(selector=repr(selector)))
 
+        self.selector = selector
+
         if selector is identity:
             return self
 
         return self._create(imap(selector, self))
 
-
-
-    def select_with_index(self, selector=lambda index, element: (index,
-                                                                 element)):
-        '''Transforms each element of a sequence into a new form, incorporating
-        the index of the element.
-
-        Each element is transformed through a selector function which accepts
-        the element value and its zero-based index in the source sequence. The
-        generated sequence is lazily evaluated.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            selector: A binary function mapping the index of a value in
-                the source sequence and the element value itself to the
-                corresponding value in the generated sequence. The two
-                positional arguments of the selector function are the zero-
-                based index of the current element and the value of the current
-                element. The return value should be the corresponding value in
-                the result sequence. The default selector produces a 2-tuple
-                containing the index and the element giving this function
-                similar behaviour to the built-in enumerate().
-
-        Returns:
-            A Queryable whose elements are the result of invoking the selector
-            function on each element of the source sequence
-
-        Raises:
-            ValueError: If this Queryable has been closed.
-            TypeError: If selector is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call select_with_index() on a "
-                             "closed Queryable.")
-
-        if not is_callable(selector):
-            raise TypeError("select_with_index() parameter selector={0} is "
-                            "not callable".format(repr(selector)))
-
-        return self._create(itertools.starmap(selector, enumerate(iter(self))))
 
     def select_many(self, collection_selector=identity,
                     result_selector=identity):
@@ -299,147 +279,6 @@ class Queryable(object):
         sequences = self.select(collection_selector)
         chained_sequence = itertools.chain.from_iterable(sequences)
         return self._create(chained_sequence).select(result_selector)
-
-    def select_many_with_index(self,
-           collection_selector=lambda index, source_element: (index,
-                                                              source_element),
-           result_selector=lambda source_element,
-                                  collection_element: collection_element):
-        '''Projects each element of a sequence to an intermediate new sequence,
-        incorporating the index of the element, flattens the resulting sequence
-        into one sequence and optionally transforms the flattened sequence
-        using a selector function.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            collection_selector: A binary function mapping each element of the
-                source sequence into an intermediate sequence, by incorporating
-                its index in the source sequence. The two positional arguments
-                to the function are the zero-based index of the source element
-                and the value of the element.  The result of the function
-                should be an iterable derived from the index and element value.
-                If no collection_selector is provided, the elements of the
-                intermediate  sequence will consist of tuples of (index,
-                element) from the source sequence.
-
-            result_selector:
-                An optional binary function mapping the elements in the
-                flattened intermediate sequence together with their
-                corresponding source elements to elements of the result
-                sequence. The two positional arguments of the result_selector
-                are, first the source element corresponding to an element from
-                the intermediate sequence, and second the actual element from
-                the intermediate sequence. The return value should be the
-                corresponding value in the result sequence. If no
-                result_selector function is provided, the elements of the
-                flattened intermediate sequence are returned untransformed.
-
-        Returns:
-            A Queryable over a generated sequence whose elements are the result
-            of applying the one-to-many collection_selector to each element of
-            the source sequence which incorporates both the index and value of
-            the source element, concatenating the results into an intermediate
-            sequence, and then mapping each of those elements through the
-            result_selector into the result sequence.
-
-        Raises:
-            ValueError: If this Queryable has been closed.
-            TypeError: If projector [and selector] are not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call select_many_with_index() on a "
-                             "closed Queryable.")
-
-        if not is_callable(collection_selector):
-            raise TypeError("select_many_with_correspondence() parameter "
-             "projector={0} is not callable".format(repr(collection_selector)))
-
-        if not is_callable(result_selector):
-            raise TypeError("select_many_with_correspondence() parameter "
-                "selector={0} is not callable".format(repr(result_selector)))
-
-        return self._create(
-                self._generate_select_many_with_index(collection_selector,
-                                                      result_selector))
-
-    def _generate_select_many_with_index(self, collection_selector,
-                                         result_selector):
-        for index, source_element in enumerate(self):
-            collection = collection_selector(index, source_element)
-            for collection_element in collection:
-                value = result_selector(source_element, collection_element)
-                yield value
-
-    def select_many_with_correspondence(self, collection_selector=identity,
-            result_selector=lambda source_element,
-                                   collection_element: (source_element,
-                                                        collection_element)):
-        '''Projects each element of a sequence to an intermediate new sequence,
-        and flattens the resulting sequence, into one sequence and uses a
-        selector function to incorporate the corresponding source for each item
-        in the result sequence.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            collection_selector: A unary function mapping each element of the
-                source iterable into an intermediate sequence. The single
-                argument of the collection_selector is the value of an element
-                from the source sequence. The return value should be an
-                iterable derived from that element value. The default
-                collection_selector, which is the identity function, assumes
-                that each element of the source sequence is itself iterable.
-
-            result_selector:
-                An optional binary function mapping the elements in the
-                flattened intermediate sequence together with their
-                corresponding source elements to elements of the result
-                sequence. The two positional arguments of the result_selector
-                are, first the source element corresponding to an element from
-                the intermediate sequence, and second the actual element from
-                the intermediate sequence. The return value should be the
-                corresponding value in the result sequence. If no
-                result_selector function is provided, the elements of the
-                result sequence are 2-tuple pairs of the form (source_element,
-                intermediate_element).
-
-        Returns:
-            A Queryable over a generated sequence whose elements are the result
-            of applying the one-to-many collection_selector to each element of
-            the source sequence, concatenating the results into an intermediate
-            sequence, and then mapping each of those elements through the
-            result_selector which incorporates the corresponding source element
-            into the result sequence.
-
-        Raises:
-            ValueError: If this Queryable has been closed.
-            TypeError: If projector or selector are not callable.
-        '''
-
-        if self.closed():
-            raise ValueError("Attempt to call "
-                "select_many_with_correspondence() on a closed Queryable.")
-
-        if not is_callable(collection_selector):
-            raise TypeError("select_many_with_correspondence() parameter "
-             "projector={0} is not callable".format(repr(collection_selector)))
-
-        if not is_callable(result_selector):
-            raise TypeError("select_many_with_correspondence() parameter "
-                "selector={0} is not callable".format(repr(result_selector)))
-
-        return self._create(
-            self._generate_select_many_with_correspondence(collection_selector,
-                                                           result_selector))
-
-    def _generate_select_many_with_correspondence(self, collection_selector,
-                                                  result_selector):
-        for source_element in self:
-            intermediate_sequence = collection_selector(source_element)
-            for intermediate_item in intermediate_sequence:
-                value = result_selector(source_element, intermediate_item)
-                yield value
 
     def group_by(self, key_selector=identity,
                  element_selector=identity,
@@ -531,6 +370,8 @@ class Queryable(object):
             raise TypeError("where() parameter predicate={predicate} is not "
                                   "callable".format(predicate=repr(predicate)))
 
+        self.where = predicate
+
         return self._create(ifilter(predicate, self))
 
     def of_type(self, classinfo):
@@ -597,6 +438,8 @@ class Queryable(object):
             raise TypeError("order_by() parameter key_selector={key_selector} "
                     "is not callable".format(key_selector=repr(key_selector)))
 
+        self.order_by = key_selector
+
         return self._create_ordered(iter(self), -1, key_selector)
 
     def order_by_descending(self, key_selector=identity):
@@ -632,6 +475,8 @@ class Queryable(object):
             raise TypeError("order_by_descending() parameter key_selector={0} "
                             "is not callable".format(repr(key_selector)))
 
+        self.order_by = key_selector
+
         return self._create_ordered(iter(self), +1, key_selector)
 
     def take(self, count=1):
@@ -658,173 +503,6 @@ class Queryable(object):
         count = max(0, count)
 
         return self._create(itertools.islice(self, count))
-
-    def take_while(self, predicate):
-        '''Returns elements from the start while the predicate is True.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            predicate: A function returning True or False with which elements
-                will be tested.
-
-        Returns:
-            A Queryable over the elements from the beginning of the source
-            sequence for which predicate is True.
-
-        Raises:
-            ValueError: If the Queryable is closed()
-            TypeError: If the predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call take_while() on a closed "
-                             "Queryable.")
-
-        if not is_callable(predicate):
-            raise TypeError("take_while() parameter predicate={0} is "
-                            "not callable".format(repr(predicate)))
-
-        # Cannot use itertools.takewhile here because it is not lazy
-        return self._create(self._generate_take_while_result(predicate))
-
-    def _generate_take_while_result(self, predicate):
-        for x in self:
-            if predicate(x):
-                yield x
-            else:
-                break
-
-    def skip(self, count=1):
-        '''Skip the first count contiguous elements of the source sequence.
-
-        If the source sequence contains fewer than count elements returns an
-        empty sequence and does not raise an exception.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            count: The number of elements to skip from the beginning of the
-                sequence. If omitted defaults to one. If count is less than one
-                the result sequence will be empty.
-
-        Returns:
-            A Queryable over the elements of source excluding the first count
-            elements.
-
-        Raises:
-            ValueError: If the Queryable is closed().
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call skip() on a closed Queryable.")
-
-        count = max(0, count)
-
-        if count == 0:
-            return self
-
-        # Try an optimised version
-        if hasattr(self._iterable, "__getitem__"):
-            try:
-                stop = len(self._iterable)
-                return self._create(self._generate_optimized_skip_result(count,
-                                                                         stop))
-            except TypeError:
-                pass
-
-        # Fall back to the unoptimized version
-        return self._create(self._generate_skip_result(count))
-
-    def _generate_optimized_skip_result(self, count, stop):
-        for i in irange(count, stop):
-            yield self._iterable[i]
-
-    def _generate_skip_result(self, count):
-        for i, item in enumerate(self):
-            if i < count:
-                continue
-            yield item
-
-    def skip_while(self, predicate):
-        '''Omit elements from the start for which a predicate is True.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            predicate: A single argument predicate function.
-
-        Returns:
-            A Queryable over the sequence of elements beginning with the first
-            element for which the predicate returns False.
-
-        Raises:
-            ValueError: If the Queryable is closed().
-            TypeError: If predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call take_while() on a "
-                            "closed Queryable.")
-
-        if not is_callable(predicate):
-            raise TypeError("skip_while() parameter predicate={0} is "
-                            "not callable".format(repr(predicate)))
-
-        return self._create(itertools.dropwhile(predicate, self))
-
-    def concat(self, second_iterable):
-        '''Concatenates two sequences.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            second_iterable: The sequence to concatenate on to the sequence.
-
-        Returns:
-            A Queryable over the concatenated sequences.
-
-        Raises:
-            ValueError: If the Queryable is closed().
-            TypeError: If second_iterable is not in fact iterable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call concat() on a closed Queryable.")
-
-        if not is_iterable(second_iterable):
-            raise TypeError("Cannot compute concat() with second_iterable of "
-                  "non-iterable {0}".format(str(type(second_iterable))[7: -1]))
-
-        return self._create(itertools.chain(self, second_iterable))
-
-    def reverse(self):
-        '''Returns the sequence reversed.
-
-        Note: This method uses deferred execution, but the whole source
-            sequence is consumed once execution commences.
-
-        Returns:
-            The source sequence in reverse order.
-
-        Raises:
-            ValueError: If the Queryable is closed().
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call reverse() on a "
-                             "closed Queryable.")
-
-        # Attempt an optimised version
-        try:
-            r = reversed(self._iterable)
-            return self._create(r)
-        except TypeError:
-            pass
-
-        # Fall through to a sequential version
-        return self._create(self._generate_reverse_result())
-
-    def _generate_reverse_result(self):
-        lst = list(iter(self))
-        lst.reverse()
-        for item in lst:
-            yield item
 
     def element_at(self, index):
         '''Return the element at ordinal index.
@@ -887,6 +565,8 @@ class Queryable(object):
             raise ValueError("Attempt to call element_at() on a "
                              "closed Queryable.")
 
+        self.count = True
+        self.count_predicate = predicate
         return self._count() if predicate is None else self._count_predicate(predicate)
 
     def _count(self):
@@ -910,69 +590,6 @@ class Queryable(object):
                             "not callable".format(repr(predicate)))
 
         return self.where(predicate).count()
-
-    def any(self, predicate=None):
-        '''Determine if the source sequence contains any elements which satisfy
-        the predicate.
-
-        Only enough of the sequence to satisfy the predicate once is consumed.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            predicate: An optional single argument function used to test each
-                element. If omitted, or None, this method returns True if there
-                is at least one element in the source.
-
-        Returns:
-            True if the sequence contains at least one element which satisfies
-            the predicate, otherwise False.
-
-        Raises:
-            ValueError: If the Queryable is closed()
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call any() on a closed Queryable.")
-
-        if predicate is None:
-            predicate = lambda x: True
-
-        if not is_callable(predicate):
-            raise TypeError("any() parameter predicate={predicate} is not callable".format(predicate=repr(predicate)))
-
-        for item in self.select(predicate):
-            if item:
-                return True
-        return False
-
-    def all(self, predicate=bool):
-        '''Determine if all elements in the source sequence satisfy a condition.
-
-        All of the source sequence will be consumed.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            predicate (callable): An optional single argument function used to
-                test each elements. If omitted, the bool() function is used
-                resulting in the elements being tested directly.
-
-        Returns:
-            True if all elements in the sequence meet the predicate condition,
-            otherwise False.
-
-        Raises:
-            ValueError: If the Queryable is closed()
-            TypeError: If predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call all() on a closed Queryable.")
-
-        if not is_callable(predicate):
-            raise TypeError("all() parameter predicate={0} is "
-                            "not callable".format(repr(predicate)))
-
-        return all(self.select(predicate))
 
     def min(self, selector=identity):
         '''Return the minimum value in a sequence.
@@ -1096,40 +713,6 @@ class Queryable(object):
             raise ValueError("Cannot compute average() of an empty sequence.")
         return total / count
 
-    def contains(self, value, equality_comparer=operator.eq):
-        '''Determines whether the sequence contains a particular value.
-
-        Execution is immediate. Depending on the type of the sequence, all or
-        none of the sequence may be consumed by this operation.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            value: The value to test for membership of the sequence
-
-        Returns:
-            True if value is in the sequence, otherwise False.
-
-        Raises:
-            ValueError: If the Queryable has been closed.
-
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call contains() on a "
-                             "closed Queryable.")
-
-        if not is_callable(equality_comparer):
-            raise TypeError("contains() parameter equality_comparer={0} is "
-                "not callable".format(repr(equality_comparer)))
-
-        if equality_comparer is operator.eq:
-            return value in self._iterable
-
-        for item in self:
-            if equality_comparer(value, item):
-                return True
-        return False
-
     def default_if_empty(self, default):
         '''If the source sequence is empty return a single element sequence
         containing the supplied default value, otherwise return the source
@@ -1170,181 +753,6 @@ class Queryable(object):
 
         except StopIteration:
             yield default
-
-    def distinct(self, selector=identity):
-        '''Eliminate duplicate elements from a sequence.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            selector: An optional single argument function the result of which
-                is the value compared for uniqueness against elements already
-                consumed. If omitted, the element value itself is compared for
-                uniqueness.
-
-        Returns:
-            Unique elements of the source sequence as determined by the
-            selector function.  Note that it is unprojected elements that are
-            returned, even if a selector was provided.
-
-        Raises:
-            ValueError: If the Queryable is closed.
-            TypeError: If the selector is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call distinct() on a "
-                             "closed Queryable.")
-
-        if not is_callable(selector):
-            raise TypeError("distinct() parameter selector={0} is "
-                "not callable".format(repr(selector)))
-
-        return self._create(self._generate_distinct_result(selector))
-
-    def _generate_distinct_result(self, selector):
-        seen = set()
-        for item in self:
-            t_item = selector(item)
-            if t_item in seen:
-                continue
-            seen.add(t_item)
-            yield item
-
-    def difference(self, second_iterable, selector=identity):
-        '''Returns those elements which are in the source sequence which are not
-        in the second_iterable.
-
-        This method is equivalent to the Except() LINQ operator, renamed to a
-        valid Python identifier.
-
-        Note: This method uses deferred execution, but as soon as execution
-            commences the entirety of the second_iterable is consumed;
-            therefore, although the source sequence may be infinite the
-            second_iterable must be finite.
-
-        Args:
-            second_iterable: Elements from this sequence are excluded from the
-                returned sequence. This sequence will be consumed in its
-                entirety, so must be finite.
-
-            selector: A optional single argument function with selects from the
-                elements of both sequences the values which will be
-                compared for equality. If omitted the identity function will
-                be used.
-
-        Returns:
-            A sequence containing all elements in the source sequence except
-            those which are also members of the second sequence.
-
-        Raises:
-            ValueError: If the Queryable has been closed.
-            TypeError: If the second_iterable is not in fact iterable.
-            TypeError: If the selector is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call difference() on a "
-                             "closed Queryable.")
-
-        if not is_iterable(second_iterable):
-            raise TypeError("Cannot compute difference() with second_iterable"
-               "of non-iterable {0}".format(str(type(second_iterable))[7: -2]))
-
-        if not is_callable(selector):
-            raise TypeError("difference() parameter selector={0} is "
-                "not callable".format(repr(selector)))
-
-        return self._create(self._generate_difference_result(second_iterable,
-                                                            selector))
-
-    def _generate_difference_result(self, second_iterable, selector):
-        seen_elements = self._create(second_iterable).select(selector)    \
-                                                     .distinct().to_set()
-        for item in self:
-            sitem = selector(item)
-            if selector(item) not in seen_elements:
-                seen_elements.add(sitem)
-                yield item
-
-    def intersect(self, second_iterable, selector=identity):
-        '''Returns those elements which are both in the source sequence and in
-        the second_iterable.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            second_iterable: Elements are returned if they are also in the
-                sequence.
-
-            selector: An optional single argument function which is used to
-                project the elements in the source and second_iterables prior
-                to comparing them. If omitted the identity function will be
-                used.
-
-        Returns:
-            A sequence containing all elements in the source sequence  which
-            are also members of the second sequence.
-
-        Raises:
-            ValueError: If the Queryable has been closed.
-            TypeError: If the second_iterable is not in fact iterable.
-            TypeError: If the selector is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call intersect() on a "
-                             "closed Queryable.")
-
-        if not is_iterable(second_iterable):
-            raise TypeError("Cannot compute intersect() with second_iterable "
-               "of non-iterable {0}".format(str(type(second_iterable))[7: -1]))
-
-        if not is_callable(selector):
-            raise TypeError("intersect() parameter selector={0} is "
-                            "not callable".format(repr(selector)))
-
-        return self._create(self._generate_intersect_result(second_iterable,
-                                                            selector))
-
-    def _generate_intersect_result(self, second_iterable, selector):
-        second_set = self._create(second_iterable).select(selector)    \
-                                                  .distinct().to_set()
-        for item in self:
-            sitem = selector(item)
-            if sitem in second_set:
-                second_set.remove(sitem)
-                yield item
-
-    def union(self, second_iterable, selector=identity):
-        '''Returns those elements which are either in the source sequence or in
-        the second_iterable, or in both.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            second_iterable: Elements from this sequence are returns if they
-                are not also in the source sequence.
-
-            selector: An optional single argument function which is used to
-                project the elements in the source and second_iterables prior
-                to comparing them. If omitted the identity function will be
-                used.
-
-        Returns:
-            A sequence containing all elements in the source sequence and second
-            sequence.
-
-        Raises:
-            ValueError: If the Queryable has been closed.
-            TypeError: If the second_iterable is not in fact iterable.
-            TypeError: If the selector is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call union() on a closed Queryable.")
-
-        if not is_iterable(second_iterable):
-            raise TypeError("Cannot compute union() with second_iterable of "
-                  "non-iterable {0}".format(str(type(second_iterable))[7: -1]))
-
-        return self._create(itertools.chain(self, second_iterable)).distinct(selector)
 
     def join(self, inner_iterable, outer_key_selector=identity,
              inner_key_selector=identity,
@@ -1492,372 +900,6 @@ class Queryable(object):
             outer_key = outer_key_selector(outer_element)
             yield result_selector(outer_element, lookup[outer_key])
 
-    def first(self, predicate=None):
-        '''The first element in a sequence (optionally satisfying a predicate).
-
-        If the predicate is omitted or is None this query returns the first
-        element in the sequence; otherwise, it returns the first element in
-        the sequence for which the predicate evaluates to True. Exceptions are
-        raised if there is no such element.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            predicate: An optional unary predicate function, the only argument
-                to which is the element. The return value should be True for
-                matching elements, otherwise False.  If the predicate is
-                omitted or None the first element of the source sequence will
-                be returned.
-
-        Returns:
-            The first element of the sequence if predicate is None, otherwise
-            the first element for which the predicate returns True.
-
-        Raises:
-            ValueError: If the Queryable is closed.
-            ValueError: If the source sequence is empty.
-            ValueError: If there are no elements matching the predicate.
-            TypeError: If the predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call first() on a closed Queryable.")
-
-        return self._first() if predicate is None else self._first_predicate(predicate)
-
-    def _first(self):
-        try:
-            return next(iter(self))
-        except StopIteration:
-            raise ValueError("Cannot return first() from an empty sequence.")
-
-    def _first_predicate(self, predicate):
-        for item in self:
-            if predicate(item):
-                return item
-        raise ValueError("No elements matching predicate in call to first()")
-
-    def first_or_default(self, default, predicate=None):
-        '''The first element (optionally satisfying a predicate) or a default.
-
-        If the predicate is omitted or is None this query returns the first
-        element in the sequence; otherwise, it returns the first element in
-        the sequence for which the predicate evaluates to True. If there is no
-        such element the value of the default argument is returned.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            default: The value which will be returned if either the sequence is
-                empty or there are no elements matching the predicate.
-
-            predicate: An optional unary predicate function, the only argument
-                to which is the element. The return value should be True for
-                matching elements, otherwise False.  If the predicate is
-                omitted or None the first element of the source sequence will
-                be returned.
-
-        Returns:
-            The first element of the sequence if predicate is None, otherwise
-            the first element for which the predicate returns True. If there is
-            no such element, the default argument is returned.
-
-        Raises:
-            ValueError: If the Queryable is closed.
-            TypeError: If the predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call first_or_default() on a "
-                             "closed Queryable.")
-
-        return self._first_or_default(default) if predicate is None else self._first_or_default_predicate(default, predicate)
-
-    def _first_or_default(self, default):
-        try:
-            return next(iter(self))
-        except StopIteration:
-            return default
-
-    def _first_or_default_predicate(self, default, predicate):
-        for item in self:
-            if predicate(item):
-                return item
-        return default
-
-    def single(self, predicate=None):
-        '''The only element (which satisfies a condition).
-
-        If the predicate is omitted or is None this query returns the only
-        element in the sequence; otherwise, it returns the only element in
-        the sequence for which the predicate evaluates to True. Exceptions are
-        raised if there is either no such element or more than one such
-        element.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            predicate: An optional unary predicate function, the only argument
-                to which is the element. The return value should be True for
-                matching elements, otherwise False.  If the predicate is
-                omitted or None the only element of the source sequence will
-                be returned.
-
-        Returns:
-            The only element of the sequence if predicate is None, otherwise
-            the only element for which the predicate returns True.
-
-        Raises:
-            ValueError: If the Queryable is closed.
-            ValueError: If, when predicate is None the source sequence contains
-                more than one element.
-            ValueError: If there are no elements matching the predicate or more
-                then one element matching the predicate.
-            TypeError: If the predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call single() on a closed Queryable.")
-
-        return self._single() if predicate is None else self._single_predicate(predicate)
-
-    def _single(self):
-        p = iter(self)
-
-        try:
-            result = next(p)
-        except StopIteration:
-            raise ValueError("Cannot return single() from an empty sequence.")
-
-        try:
-            next(p)
-        except StopIteration:
-            return result
-
-        raise ValueError("Sequence for single() contains multiple elements")
-
-    def _single_predicate(self, predicate):
-        found = False
-        for item in self:
-            if predicate(item):
-                if found == True:
-                    raise ValueError("Sequence contains more than one value matching single() predicate.")
-                result = item
-                found = True
-        if found == False:
-            raise ValueError("Sequence for single() contains no items matching the predicate.")
-        return result
-
-    def single_or_default(self, default, predicate=None):
-        '''The only element (which satisfies a condition) or a default.
-
-        If the predicate is omitted or is None this query returns the only
-        element in the sequence; otherwise, it returns the only element in
-        the sequence for which the predicate evaluates to True. A default value
-        is returned if there is no such element. An exception is raised if
-        there is more than one such element.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            default: The value which will be returned if either the sequence is
-                empty or there are no elements matching the predicate.
-
-            predicate: An optional unary predicate function, the only argument
-                to which is the element. The return value should be True for
-                matching elements, otherwise False.  If the predicate is
-                omitted or None the only element of the source sequence will
-                be returned.
-
-        Returns:
-            The only element of the sequence if predicate is None, otherwise
-            the only element for which the predicate returns True. If there are
-            no such elements the default value will returned.
-
-        Raises:
-            ValueError: If the Queryable is closed.
-            ValueError: If, when predicate is None the source sequence contains
-                more than one element.
-            ValueError: If there is more then one element matching the
-                predicate.
-            TypeError: If the predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call single_or_default() on a closed Queryable.")
-
-        return self._single_or_default(default) if predicate is None else self._single_or_default_predicate(default, predicate)
-
-    def _single_or_default(self, default):
-        p = iter(self)
-
-        try:
-            result = next(p)
-        except StopIteration:
-            return default
-
-        try:
-            next(p)
-        except StopIteration:
-            return result
-
-        raise ValueError("Sequence for single_or_default() contains multiple elements.")
-
-    def _single_or_default_predicate(self, default, predicate):
-        found = False
-        result = default
-        for item in self:
-            if predicate(item):
-                if found == True:
-                    raise ValueError("Sequence contains more than one value matching single_or_default() predicate.")
-                result = item
-                found = True
-        return result
-
-    def last(self, predicate=None):
-        '''The last element in a sequence (optionally satisfying a predicate).
-
-        If the predicate is omitted or is None this query returns the last
-        element in the sequence; otherwise, it returns the last element in
-        the sequence for which the predicate evaluates to True. Exceptions are
-        raised if there is no such element.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            predicate: An optional unary predicate function, the only argument
-                to which is the element. The return value should be True for
-                matching elements, otherwise False.  If the predicate is
-                omitted or None the last element of the source sequence will
-                be returned.
-
-        Returns:
-            The last element of the sequence if predicate is None, otherwise
-            the last element for which the predicate returns True.
-
-        Raises:
-            ValueError: If the Queryable is closed.
-            ValueError: If the source sequence is empty.
-            ValueError: If there are no elements matching the predicate.
-            TypeError: If the predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call last() on a closed Queryable.")
-
-        return self._last() if predicate is None else self._last_predicate(predicate)
-
-    def _last(self):
-        # Attempt an optimised version
-        try:
-            return self._iterable[-1]
-        except IndexError:
-            raise ValueError("Cannot return last() from an empty sequence.")
-        except TypeError:
-            pass
-
-        sentinel = object()
-        result = sentinel
-
-        for item in self:
-            result = item
-
-        if result is sentinel:
-            raise ValueError("Cannot return last() from an empty sequence.")
-
-        return result
-
-    def _last_predicate(self, predicate):
-        # Attempt an optimised version
-        try:
-            r = reversed(self._iterable)
-            self._create(r).first(predicate)
-        except TypeError:
-            pass
-
-        # Fall through to the sequential version
-        sentinel = object()
-        result = sentinel
-
-        for item in self:
-            if predicate(item):
-                result = item
-
-        if result is sentinel:
-            raise ValueError("No item matching predicate in call to last().")
-
-        return result
-
-    def last_or_default(self, default, predicate=None):
-        '''The last element (optionally satisfying a predicate) or a default.
-
-        If the predicate is omitted or is None this query returns the last
-        element in the sequence; otherwise, it returns the last element in
-        the sequence for which the predicate evaluates to True. If there is no
-        such element the value of the default argument is returned.
-
-        Note: This method uses immediate execution.
-
-        Args:
-            default: The value which will be returned if either the sequence is
-                empty or there are no elements matching the predicate.
-
-            predicate: An optional unary predicate function, the only argument
-                to which is the element. The return value should be True for
-                matching elements, otherwise False.  If the predicate is
-                omitted or None the last element of the source sequence will
-                be returned.
-
-        Returns:
-            The last element of the sequence if predicate is None, otherwise
-            the last element for which the predicate returns True. If there is
-            no such element, the default argument is returned.
-
-        Raises:
-            ValueError: If the Queryable is closed.
-            TypeError: If the predicate is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call last_or_default() on a "
-                             "closed Queryable.")
-
-        return self._last_or_default(default) if predicate is None else self._last_or_default_predicate(default, predicate)
-
-    def _last_or_default(self, default):
-        # Attempt an optimised version
-        try:
-            return self._iterable[-1]
-        except IndexError:
-            return default
-        except TypeError:
-            pass
-
-        # Fall through to the sequential version
-        sentinel = object()
-        result = sentinel
-
-        for item in iter(self):
-            result = item
-
-        if result is sentinel:
-            return default
-
-        return result
-
-    def _last_or_default_predicate(self, default, predicate):
-        try:
-            r = reversed(self._iterable)
-            return self._create(r).first_or_default(default, predicate)
-        except TypeError:
-            # Fall through to the sequential version
-            pass
-
-        sentinel = object()
-        result = sentinel
-
-        for item in iter(self):
-            if predicate(item):
-                result = item
-
-        if result is sentinel:
-            return default
-
-        return result
 
     def aggregate(self, reducer, seed=default, result_selector=identity):
         '''Apply a function over a sequence to produce a single result.
@@ -1907,48 +949,6 @@ class Queryable(object):
                     raise ValueError("Cannot aggregate() empty sequence with "
                                      "no seed value")
         return result_selector(fold(reducer, self, seed))
-
-    def zip(self, second_iterable, result_selector=lambda x, y: (x, y)):
-        '''Elementwise combination of two sequences.
-
-        The source sequence and the second iterable are merged element-by-
-        element using a function to combine them into the single corresponding
-        element of the result sequence. The length of the result sequence is
-        equal to the length of the shorter of the two input sequences.
-
-        Note: This method uses deferred execution.
-
-        Args:
-            second_iterable: The second sequence to be combined with the source
-                sequence.
-
-            result_selector: An optional binary function for combining
-                corresponding elements of the source sequences into an
-                element of the result sequence. The first and second positional
-                arguments are the elements from the source sequences. The
-                result should be the result sequence element. If omitted, the
-                result sequence will consist of 2-tuple pairs of corresponding
-                elements from the source sequences.
-
-        Returns:
-            A Queryable over the merged elements.
-
-        Raises:
-            ValueError: If the Queryable is closed.
-            TypeError: If result_selector is not callable.
-        '''
-        if self.closed():
-            raise ValueError("Attempt to call zip() on a closed Queryable.")
-
-        if not is_iterable(second_iterable):
-            raise TypeError("Cannot compute zip() with second_iterable of "
-                  "non-iterable {0}".format(str(type(second_iterable))[7: -1]))
-
-        if not is_callable(result_selector):
-            raise TypeError("zip() parameter result_selector={0} is "
-                            "not callable".format(repr(result_selector)))
-
-        return self._create(result_selector(*t) for t in izip(self, second_iterable))
 
     def to_list(self):
         '''Convert the source sequence to a list.
