@@ -31,6 +31,30 @@ def query(iterable):
     return Queryable(iterable)
 
 
+def query2(iterable):
+    '''Make an iterable queryable.
+
+    Use this function as an entry-point to the asq system of chainable query
+    methods.
+
+    Note: Currently this factory only provides support for objects supporting
+        the iterator protocol.  Future implementations may support other
+        providers.
+
+    Args:
+        iterable: Any object supporting the iterator protocol.
+
+    Returns:
+        An instance of Queryable.
+
+    Raises:
+        TypeError: If iterable is not actually iterable
+    '''
+    # Avoid a circular module dependency
+    from .queryables2 import Queryable
+    return Queryable(iterable)
+
+
 def integers(start, count):
     '''Generates in sequence the integral numbers within a range.
 
